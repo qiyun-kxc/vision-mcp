@@ -1,0 +1,20 @@
+{
+  "name": "vision-mcp-server",
+  "version": "1.1.0",
+  "description": "Video understanding MCP server with multi-provider routing (Gemini / Qwen / Kimi)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "video", "vision", "gemini", "qwen", "bilibili"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@google/genai": "^1.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "openai": "^4.70.0",
+    "zod": "^3.23.0"
+  }
+}
