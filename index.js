@@ -27,7 +27,7 @@ const MODEL_CATALOG = {
   "gemini-2.5-flash":       { provider: "gemini", desc: "Free tier, fast and cheap" },
   "gemini-2.5-pro":         { provider: "gemini", desc: "Free tier, stronger reasoning" },
   "gemini-3-flash-preview": { provider: "gemini", desc: "Latest Flash, frontier-level" },
-  "gemini-3-pro-preview":   { provider: "gemini", desc: "Strongest Gemini, paid only" },
+  "gemini-3.1-pro-preview": { provider: "gemini", desc: "Strongest Gemini, paid only" },
   "qwen3.5-omni-plus":      { provider: "dashscope", desc: "Omnimodal flagship, 215 SOTA" },
   "qwen3.5-omni-flash":     { provider: "dashscope", desc: "Omnimodal mid-tier" },
   "qwen3.5-omni-light":     { provider: "dashscope", desc: "Omnimodal lightweight" },
