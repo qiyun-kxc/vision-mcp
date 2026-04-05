@@ -1,6 +1,6 @@
 # 👁️ vision-mcp
 
-**小克的眼睛** — Video understanding MCP server with multi-provider routing.
+**Video understanding MCP server** with multi-provider routing, security hardening, and concurrency control.
 
 An MCP (Model Context Protocol) server that enables AI assistants to "watch" videos by routing requests to multiple vision-language model providers.
 
@@ -9,9 +9,22 @@ An MCP (Model Context Protocol) server that enables AI assistants to "watch" vid
 - **Multi-provider routing**: Gemini, DashScope (Qwen/Kimi), with automatic fallback
 - **YouTube**: Direct URL pass-through to Gemini (no download needed)
 - **Bilibili**: API-based download that bypasses geo-restrictions from overseas servers
-- **Local files**: Served via public URL to avoid base64 timeout issues
 - **13 models** across 3 providers, manually selectable or auto-routed
-- **Smart routing**: YouTube → Gemini, Bilibili/local → Qwen, with cascading fallback
+- **Security hardened** (v1.3): command injection prevention, SSRF protection, deterministic file cleanup
+- **Concurrency control**: Semaphore-based limit on concurrent heavy tasks
+- **SSE_MSG_PATH**: Nginx sub_filter-free architecture via environment variable
+
+## Security (v1.3)
+
+| Protection | Implementation |
+|---|---|
+| Command injection | `execFile` with argument arrays instead of shell string concatenation |
+| SSRF | URL validation blocking internal IPs, cloud metadata, CGNAT ranges |
+| File cleanup | Deterministic `try/finally` + `Set` tracking (no `setTimeout`) |
+| Filename guessing | `crypto.randomUUID()` instead of `Date.now()` timestamps |
+| Large file DoS | `curl --max-filesize` and `yt-dlp --max-filesize` (50MB cap) |
+| Resource exhaustion | Semaphore-based concurrency limit (default: 2 concurrent tasks) |
+| Startup residue | Automatic cleanup of leftover temp files on process start |
 
 ## Supported Models
 
@@ -20,7 +33,7 @@ An MCP (Model Context Protocol) server that enables AI assistants to "watch" vid
 | `gemini-2.5-flash` | Gemini | Free tier, fast and cheap |
 | `gemini-2.5-pro` | Gemini | Free tier, stronger reasoning |
 | `gemini-3-flash-preview` | Gemini | Latest Flash, frontier-level |
-| `gemini-3-pro-preview` | Gemini | Strongest Gemini, paid only |
+| `gemini-3.1-pro-preview` | Gemini | Strongest Gemini, paid only |
 | `qwen3.5-omni-plus` | DashScope | Omnimodal flagship, 215 SOTA |
 | `qwen3.5-omni-flash` | DashScope | Omnimodal mid-tier |
 | `qwen3.5-omni-light` | DashScope | Omnimodal lightweight |
@@ -41,18 +54,13 @@ An MCP (Model Context Protocol) server that enables AI assistants to "watch" vid
 ## Setup
 
 ```bash
-# Clone
 git clone https://github.com/qiyun-kxc/vision-mcp.git
 cd vision-mcp
-
-# Install dependencies
 npm install
 
-# Configure API keys
 cp config.env.example config.env
 # Edit config.env with your API keys
 
-# Start
 node index.js
 # Or with pm2:
 pm2 start start.sh --name vision-mcp
@@ -60,17 +68,36 @@ pm2 start start.sh --name vision-mcp
 
 ## Configuration
 
-Copy `config.env.example` to `config.env` and fill in your API keys:
-
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | Yes | Google AI Studio API key |
 | `DASHSCOPE_API_KEY_BEIJING` | Yes | Alibaba DashScope Beijing region |
 | `DASHSCOPE_API_KEY_SINGAPORE` | Optional | Alibaba DashScope Singapore region |
-| `BILI_COOKIE_PATH` | Optional | Path to file containing Bilibili cookies |
-| `PUBLIC_URL_BASE` | Optional | Base URL for serving temp video files |
-| `PUBLIC_DIR` | Optional | Directory for temp video files served by nginx |
 | `VISION_MCP_PORT` | Optional | Server port (default: 18092) |
+| `SSE_MSG_PATH` | Optional | External SSE message path for Nginx routing |
+
+## Nginx Integration
+
+Instead of using fragile `sub_filter` rules, set `SSE_MSG_PATH` in your config to the external path clients will use:
+
+```env
+SSE_MSG_PATH=/vision/terminal/messages
+```
+
+Then Nginx only needs pure `proxy_pass` — no stream rewriting:
+
+```nginx
+location /vision/sse {
+    proxy_pass http://127.0.0.1:18092/sse;
+    # ... standard SSE proxy headers ...
+    # No sub_filter needed!
+}
+
+location /vision/terminal/messages {
+    proxy_pass http://127.0.0.1:18092/terminal/messages;
+    # ... standard proxy headers ...
+}
+```
 
 ## MCP Tools
 
@@ -89,27 +116,27 @@ Check the configuration status of all providers and list available models.
 ## Architecture
 
 ```
-YouTube URL ──→ Gemini (direct pass-through)
+YouTube URL ──→ Gemini (direct pass-through, no download)
                     ↓ (fallback)
 Bilibili URL ─→ API download ─→ ffmpeg compress ─→ nginx serve ─→ Qwen
                                                                     ↓ (fallback)
-Other URL ───→ yt-dlp download ─→ ...                            Kimi
-                                                                    
+Other URL ───→ yt-dlp download (SSRF-validated) ─→ ...            Kimi
+
 Local file ──→ copy to public dir ─→ nginx serve ─→ Qwen/Gemini
+
+All paths ─→ Semaphore gate (max 2) ─→ try/finally cleanup
 ```
 
-## Bilibili Support
+## Observability
 
-Bilibili videos are downloaded using the Bilibili API instead of yt-dlp, which bypasses geo-restrictions that block direct access from overseas servers. The flow:
+All stages are logged with timing:
+- Download duration and file size
+- Compression before/after size and duration
+- Model inference duration
+- Total request duration
+- Concurrency slot acquire/release events
 
-1. Extract BV ID from URL
-2. Fetch video info (cid) via Bilibili API
-3. Get stream URL via playurl API
-4. Download from Akamai CDN (globally accessible)
-5. Compress with ffmpeg if needed
-6. Serve via nginx public URL
-
-Requires a valid Bilibili cookie file (can be shared from bilibili-mcp).
+The `/health` endpoint reports real-time concurrency status.
 
 ## License
 

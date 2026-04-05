@@ -4,25 +4,80 @@ import express from "express";
 import { z } from "zod";
 import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
-import { execSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
 
-dotenv.config({ path: process.env.CONFIG_PATH || path.join(process.cwd(), "config.env") });
+const execFileAsync = promisify(execFile);
+
+dotenv.config({ path: "/opt/vision-mcp/config.env" });
 
 const PORT = parseInt(process.env.VISION_MCP_PORT || "18092");
 const TEMP_DIR = process.env.VIDEO_TEMP_DIR || "/tmp/vision-mcp-videos";
-const PUBLIC_DIR = process.env.PUBLIC_DIR || "/var/www/html/tmp";
-const PUBLIC_URL_BASE = process.env.PUBLIC_URL_BASE || "";
-const BILI_COOKIE_PATH = process.env.BILI_COOKIE_PATH || "";
+const PUB_DIR = "/var/www/html/tmp";
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_CONCURRENCY = 2;
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
-if (PUBLIC_DIR && !fs.existsSync(PUBLIC_DIR)) {
-  try { fs.mkdirSync(PUBLIC_DIR, { recursive: true }); } catch {}
+// SSE path: the external path clients see (through Nginx), eliminates sub_filter dependency
+const SSE_MSG_PATH = process.env.SSE_MSG_PATH || "/terminal/messages";
+
+// ========== Concurrency control (lightweight semaphore, zero deps) ==========
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.active = 0;
+    this.queue = [];
+  }
+  acquire() {
+    return new Promise(resolve => {
+      if (this.active < this.max) {
+        this.active++;
+        resolve();
+      } else {
+        this.queue.push(resolve);
+      }
+    });
+  }
+  release() {
+    this.active--;
+    if (this.queue.length > 0) {
+      this.active++;
+      const next = this.queue.shift();
+      next();
+    }
+  }
+  get pending() { return this.queue.length; }
 }
 
-// ========== Model Catalog ==========
+const taskSemaphore = new Semaphore(MAX_CONCURRENCY);
+
+// ========== Startup cleanup ==========
+
+function cleanupOnStartup() {
+  for (const dir of [TEMP_DIR, PUB_DIR]) {
+    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); continue; }
+    try {
+      const files = fs.readdirSync(dir);
+      let cleaned = 0;
+      for (const f of files) {
+        if (/\.(mp4|webm|mkv|tmp)$/i.test(f)) {
+          try { fs.unlinkSync(path.join(dir, f)); cleaned++; } catch {}
+        }
+      }
+      if (cleaned > 0) console.log(`\uD83E\uDDF9 Startup cleanup: ${dir} removed ${cleaned} leftover files`);
+    } catch {}
+  }
+}
+cleanupOnStartup();
+
+const BILI_COOKIE_PATH = "/home/ubuntu/bilibili-mcp-server/config.yml";
+
+// ========== Model catalog ==========
+
 const MODEL_CATALOG = {
   "gemini-2.5-flash":       { provider: "gemini", desc: "Free tier, fast and cheap" },
   "gemini-2.5-pro":         { provider: "gemini", desc: "Free tier, stronger reasoning" },
@@ -45,6 +100,26 @@ const DEFAULTS = {
   fallback: "kimi-k2.5",
 };
 
+// ========== Security ==========
+
+function validateUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new Error("Invalid URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only HTTP/HTTPS protocols allowed");
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const blocked = [
+    /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./,
+    /^0\./, /^localhost$/i, /^::1$/, /^fe80:/i,
+    /^169\.254\./, /^metadata\./i,
+    /^100\.(6[4-9]|[7-9]\d|1[0-2][0-9]|12[0-7])\./,
+  ];
+  if (blocked.some(r => r.test(hostname))) {
+    throw new Error("Access to internal/metadata addresses is not allowed");
+  }
+}
+
 // ========== Utilities ==========
 
 function isYouTubeUrl(url) {
@@ -53,15 +128,19 @@ function isYouTubeUrl(url) {
 function isBilibiliUrl(url) {
   return /^https?:\/\/(www\.)?(bilibili\.com|b23\.tv)\//.test(url);
 }
-function cleanup(fp) {
-  try { if (fp && fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
+function cleanup(...fps) {
+  for (const fp of fps) {
+    try { if (fp && fs.existsSync(fp)) fs.unlinkSync(fp); } catch {}
+  }
+}
+function cleanupSet(s) {
+  for (const fp of s) cleanup(fp);
 }
 
 function getBiliCookie() {
-  if (!BILI_COOKIE_PATH) return null;
   try {
-    const content = fs.readFileSync(BILI_COOKIE_PATH, "utf-8");
-    const match = content.match(/^Cookie:\s*(.+)$/m);
+    const yml = fs.readFileSync(BILI_COOKIE_PATH, "utf-8");
+    const match = yml.match(/^Cookie:\s*(.+)$/m);
     return match ? match[1].trim() : null;
   } catch { return null; }
 }
@@ -71,19 +150,9 @@ function extractBvid(url) {
   return m ? m[0] : null;
 }
 
-// Serve a local file via public URL (for DashScope which can't handle large base64)
-function servePublicly(localPath) {
-  if (!PUBLIC_DIR || !PUBLIC_URL_BASE) return null;
-  const fname = "v_" + Date.now() + ".mp4";
-  const pubPath = path.join(PUBLIC_DIR, fname);
-  fs.copyFileSync(localPath, pubPath);
-  setTimeout(() => cleanup(pubPath), 60000);
-  return PUBLIC_URL_BASE + "/" + fname;
-}
+// ========== Download (secure: execFile + arg arrays, no shell injection) ==========
 
-// ========== Bilibili Download ==========
-
-function downloadBilibili(url) {
+async function downloadBilibili(url) {
   const bvid = extractBvid(url);
   if (!bvid) throw new Error("Cannot extract BV ID from URL");
 
@@ -91,43 +160,87 @@ function downloadBilibili(url) {
   if (!cookie) throw new Error("Bilibili cookie not available");
 
   const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0";
-  const curlBase = `curl -s -H "Cookie: ${cookie}" -H "User-Agent: ${UA}" -H "Referer: https://www.bilibili.com/"`;
+  const commonArgs = ["-s", "-H", `Cookie: ${cookie}`, "-H", `User-Agent: ${UA}`, "-H", "Referer: https://www.bilibili.com/"];
 
-  const infoJson = execSync(`${curlBase} "https://api.bilibili.com/x/web-interface/view?bvid=${bvid}"`, { timeout: 15000 }).toString();
+  const t0 = Date.now();
+
+  const { stdout: infoJson } = await execFileAsync("curl", [
+    ...commonArgs,
+    `https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`
+  ], { timeout: 15000 });
+
   const info = JSON.parse(infoJson);
-  if (info.code !== 0) throw new Error(`Bilibili info failed: ${info.message}`);
+  if (info.code !== 0) throw new Error(`Bilibili API error: ${info.message}`);
 
   const { cid, title, duration } = info.data;
-  console.log(`📺 Bilibili: ${title} (${duration}s)`);
+  console.log(`\uD83D\uDCFA Bilibili: ${title} (${duration}s)`);
 
-  const playJson = execSync(`${curlBase} "https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=32&fnval=1"`, { timeout: 15000 }).toString();
+  const { stdout: playJson } = await execFileAsync("curl", [
+    ...commonArgs,
+    `https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=32&fnval=1`
+  ], { timeout: 15000 });
+
   const play = JSON.parse(playJson);
   if (play.code !== 0 || !play.data?.durl?.[0]) throw new Error("Bilibili playurl failed");
 
   const videoUrl = play.data.durl[0].url;
-  const filepath = path.join(TEMP_DIR, `bili_${bvid}_${Date.now()}.mp4`);
-  execSync(`curl -s -L -o "${filepath}" -H "Referer: https://www.bilibili.com/" -H "User-Agent: ${UA}" "${videoUrl}"`, { timeout: 180000 });
+  const uid = crypto.randomUUID();
+  const filepath = path.join(TEMP_DIR, `bili_${uid}.mp4`);
 
+  await execFileAsync("curl", [
+    "-s", "-L",
+    "--max-filesize", String(MAX_DOWNLOAD_BYTES),
+    "-o", filepath,
+    "-H", "Referer: https://www.bilibili.com/",
+    "-H", `User-Agent: ${UA}`,
+    videoUrl
+  ], { timeout: 180000 });
+
+  const dlMs = Date.now() - t0;
   const stats = fs.statSync(filepath);
+  console.log(`\uD83D\uDCE5 Bilibili download: ${(stats.size / 1024 / 1024).toFixed(1)}MB, ${dlMs}ms`);
+
   if (stats.size > 2 * 1024 * 1024) {
+    const compressed = path.join(PUB_DIR, `v_${uid}.mp4`);
     const maxDur = Math.min(duration, 300);
-    const compressed = path.join(PUBLIC_DIR || TEMP_DIR, `bili_${bvid}_${Date.now()}.mp4`);
-    execSync(`ffmpeg -i "${filepath}" -t ${maxDur} -vf "scale=320:-2" -b:v 200k -an -y "${compressed}" 2>/dev/null`, { timeout: 120000 });
+    const t1 = Date.now();
+    await execFileAsync("ffmpeg", [
+      "-i", filepath,
+      "-t", String(maxDur),
+      "-vf", "scale=320:-2",
+      "-b:v", "200k",
+      "-an", "-y",
+      compressed
+    ], { timeout: 120000 });
+
     fs.unlinkSync(filepath);
+    const compStats = fs.statSync(compressed);
+    console.log(`\uD83D\uDDDC\uFE0F Compressed: ${(stats.size / 1024 / 1024).toFixed(1)}MB -> ${(compStats.size / 1024 / 1024).toFixed(1)}MB, ${Date.now() - t1}ms`);
     return compressed;
   }
 
   return filepath;
 }
 
-function downloadOther(url) {
-  const filename = `video_${Date.now()}.mp4`;
-  const filepath = path.join(TEMP_DIR, filename);
-  execSync(
-    `yt-dlp -f "bestvideo[height<=480]+bestaudio/best[height<=480]/best" ` +
-    `--merge-output-format mp4 -o "${filepath}" "${url}" --no-playlist --quiet`,
-    { timeout: 180000 }
-  );
+async function downloadOther(url) {
+  validateUrl(url);
+  const uid = crypto.randomUUID();
+  const filepath = path.join(TEMP_DIR, `video_${uid}.mp4`);
+
+  const t0 = Date.now();
+  const ytdlpPath = "/home/ubuntu/.local/bin/yt-dlp";
+  await execFileAsync(ytdlpPath, [
+    "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+    "--merge-output-format", "mp4",
+    "-o", filepath,
+    url,
+    "--no-playlist",
+    "--quiet",
+    "--max-filesize", `${MAX_DOWNLOAD_BYTES}`
+  ], { timeout: 180000, env: { ...process.env, PATH: process.env.PATH + ":/home/ubuntu/.local/bin" } });
+
+  const stats = fs.statSync(filepath);
+  console.log(`\uD83D\uDCE5 yt-dlp download: ${(stats.size / 1024 / 1024).toFixed(1)}MB, ${Date.now() - t0}ms`);
   return filepath;
 }
 
@@ -157,7 +270,7 @@ async function callGemini(source, prompt, model, isFile) {
 
   parts.push({ text: prompt });
   const result = await ai.models.generateContent({ model, contents: [{ role: "user", parts }] });
-  return result.text || "(No response)";
+  return result.text || "(No response from Gemini)";
 }
 
 // ========== DashScope ==========
@@ -172,35 +285,23 @@ function getDashScopeClient(region) {
   return new OpenAI({ apiKey, baseURL });
 }
 
-async function callDashScope(source, prompt, model, isFile, region) {
-  // Serve local files via public URL to avoid base64 timeout
+async function callDashScope(source, prompt, model, isFile, region, filesToClean) {
   if (isFile) {
-    const pubUrl = servePublicly(source);
-    if (pubUrl) {
-      source = pubUrl;
-      isFile = false;
+    let pubPath;
+    if (!source.startsWith(PUB_DIR)) {
+      const uid = crypto.randomUUID();
+      pubPath = path.join(PUB_DIR, `ds_${uid}.mp4`);
+      fs.copyFileSync(source, pubPath);
+    } else {
+      pubPath = source;
     }
-  }
-  // Files in PUBLIC_DIR can also be served
-  if (isFile && PUBLIC_DIR && source.startsWith(PUBLIC_DIR)) {
-    const fname = path.basename(source);
-    if (PUBLIC_URL_BASE) {
-      source = PUBLIC_URL_BASE + "/" + fname;
-      isFile = false;
-      setTimeout(() => cleanup(path.join(PUBLIC_DIR, fname)), 60000);
-    }
+    filesToClean.add(pubPath);
+    source = `https://qiyun.cloud/tmp/${path.basename(pubPath)}`;
+    isFile = false;
   }
 
   const client = getDashScopeClient(region);
-
-  let videoContent;
-  if (isFile) {
-    const data = fs.readFileSync(source);
-    const b64 = data.toString("base64");
-    videoContent = { type: "video_url", video_url: { url: `data:video/mp4;base64,${b64}` } };
-  } else {
-    videoContent = { type: "video_url", video_url: { url: source } };
-  }
+  const videoContent = { type: "video_url", video_url: { url: source } };
 
   const resp = await client.chat.completions.create({
     model,
@@ -210,20 +311,25 @@ async function callDashScope(source, prompt, model, isFile, region) {
   return resp.choices?.[0]?.message?.content || "(No response)";
 }
 
-// ========== Smart Router ==========
+// ========== Smart routing ==========
 
 async function watchVideo(source, prompt, model) {
-  let localFile = null;
+  const filesToClean = new Set();
   const isFileInput = !source.startsWith("http");
+  const totalT0 = Date.now();
 
   try {
+    let localFile = null;
+
     if (!isFileInput) {
       if (isBilibiliUrl(source)) {
-        console.log("📥 Bilibili URL, downloading via API...");
-        localFile = downloadBilibili(source);
+        console.log("\uD83D\uDCE5 Bilibili URL, downloading via API...");
+        localFile = await downloadBilibili(source);
+        filesToClean.add(localFile);
       } else if (!isYouTubeUrl(source)) {
-        console.log("📥 Other URL, downloading via yt-dlp...");
-        localFile = downloadOther(source);
+        console.log("\uD83D\uDCE5 Other URL, downloading via yt-dlp...");
+        localFile = await downloadOther(source);
+        filesToClean.add(localFile);
       }
     }
 
@@ -239,45 +345,48 @@ async function watchVideo(source, prompt, model) {
         attempts = [{ fn: () => callGemini(actualSource, prompt, model, isFile), label: model }];
       } else {
         attempts = [
-          { fn: () => callDashScope(actualSource, prompt, model, isFile, "beijing"), label: `${model} (Beijing)` },
-          { fn: () => callDashScope(actualSource, prompt, model, isFile, "singapore"), label: `${model} (Singapore)` },
+          { fn: () => callDashScope(actualSource, prompt, model, isFile, "beijing", filesToClean), label: `${model} (Beijing)` },
+          { fn: () => callDashScope(actualSource, prompt, model, isFile, "singapore", filesToClean), label: `${model} (Singapore)` },
         ];
       }
     } else {
       if (isYouTubeUrl(source) && !localFile) {
         attempts = [
           { fn: () => callGemini(actualSource, prompt, DEFAULTS.gemini, false), label: DEFAULTS.gemini },
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, false, "beijing"), label: `${DEFAULTS.dashscope} (Beijing)` },
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, false, "singapore"), label: `${DEFAULTS.dashscope} (Singapore)` },
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.fallback, false, "beijing"), label: `${DEFAULTS.fallback} (Beijing)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, false, "beijing", filesToClean), label: `${DEFAULTS.dashscope} (Beijing)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, false, "singapore", filesToClean), label: `${DEFAULTS.dashscope} (Singapore)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.fallback, false, "beijing", filesToClean), label: `${DEFAULTS.fallback} (Beijing)` },
         ];
       } else {
         attempts = [
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, isFile, "beijing"), label: `${DEFAULTS.dashscope} (Beijing)` },
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, isFile, "singapore"), label: `${DEFAULTS.dashscope} (Singapore)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, isFile, "beijing", filesToClean), label: `${DEFAULTS.dashscope} (Beijing)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.dashscope, isFile, "singapore", filesToClean), label: `${DEFAULTS.dashscope} (Singapore)` },
           { fn: () => callGemini(actualSource, prompt, DEFAULTS.gemini, isFile), label: DEFAULTS.gemini },
-          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.fallback, isFile, "beijing"), label: `${DEFAULTS.fallback} (Beijing)` },
+          { fn: () => callDashScope(actualSource, prompt, DEFAULTS.fallback, isFile, "beijing", filesToClean), label: `${DEFAULTS.fallback} (Beijing)` },
         ];
       }
     }
 
     for (const { fn, label } of attempts) {
       try {
-        console.log(`👁️ ${label}...`);
+        console.log(`\uD83D\uDC41\uFE0F Trying ${label}...`);
+        const t0 = Date.now();
         const result = await fn();
+        console.log(`\u2705 ${label} done, inference ${Date.now() - t0}ms, total ${Date.now() - totalT0}ms`);
         return { result, usedModel: label };
       } catch (err) {
-        console.log(`⚠️ ${label}: ${err.message}`);
+        console.log(`\u26A0\uFE0F ${label} failed: ${err.message}`);
       }
     }
 
-    throw new Error("All providers unavailable");
+    throw new Error("All video understanding services unavailable");
+
   } finally {
-    cleanup(localFile);
+    cleanupSet(filesToClean);
   }
 }
 
-// ========== MCP Tools ==========
+// ========== MCP tool registration ==========
 
 const MODEL_NAMES = ["auto", ...Object.keys(MODEL_CATALOG)];
 
@@ -286,19 +395,30 @@ function registerTools(s) {
     "watch_video",
     {
       title: "Watch Video",
-      description: "Watch a video and get a text description. Supports YouTube (direct), Bilibili (API download), and local files.\nauto = smart routing, or specify a model.",
+      description: `Video understanding via multi-provider routing.\nauto = smart routing, or specify a model.\nBilibili via API download, YouTube direct to Gemini.\nConcurrency limit: ${MAX_CONCURRENCY}, excess requests queued.`,
       inputSchema: {
-        source: z.string().describe("Video URL (YouTube/Bilibili/other) or local file path"),
+        source: z.string().describe("Video URL (YouTube/Bilibili/etc) or local file path"),
         prompt: z.string().default("Describe this video in detail, including visuals, audio, and text.").describe("What to look for"),
         model: z.enum(MODEL_NAMES).default("auto").describe("Model to use, auto = smart routing"),
       },
     },
     async ({ source, prompt, model }) => {
+      const queuePos = taskSemaphore.pending;
+      if (queuePos > 0) {
+        console.log(`\u23F3 Queued... ${queuePos} ahead, ${taskSemaphore.active}/${taskSemaphore.max} active`);
+      }
+
+      await taskSemaphore.acquire();
+      console.log(`\uD83D\uDD13 Acquired slot (${taskSemaphore.active}/${taskSemaphore.max} active, ${taskSemaphore.pending} queued)`);
+
       try {
         const { result, usedModel } = await watchVideo(source, prompt, model);
-        return { content: [{ type: "text", text: `👁️ [${usedModel}]\n\n${result}` }] };
+        return { content: [{ type: "text", text: `\uD83D\uDC41\uFE0F [${usedModel}]\n\n${result}` }] };
       } catch (err) {
-        return { content: [{ type: "text", text: `❌ Failed: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `\u274C Video understanding failed: ${err.message}` }], isError: true };
+      } finally {
+        taskSemaphore.release();
+        console.log(`\uD83D\uDD13 Released slot (${taskSemaphore.active}/${taskSemaphore.max} active, ${taskSemaphore.pending} queued)`);
       }
     }
   );
@@ -307,26 +427,32 @@ function registerTools(s) {
     "vision_status",
     {
       title: "Vision Status",
-      description: "Check provider configuration and available models.",
+      description: "Check configuration status of all providers and list available models.",
       inputSchema: {},
     },
     async () => {
       const ok = k => {
         const v = process.env[k];
-        return v && !v.startsWith("YOUR_") ? "✅" : "❌";
+        return v && !v.startsWith("YOUR_") ? "\u2705" : "\u274C";
       };
-      const biliOk = getBiliCookie() ? "✅" : "❌";
+      const biliOk = getBiliCookie() ? "\u2705" : "\u274C";
+      const ytdlpOk = fs.existsSync("/home/ubuntu/.local/bin/yt-dlp") ? "\u2705" : "\u274C";
+      let ffmpegOk;
+      try { await execFileAsync("which", ["ffmpeg"]); ffmpegOk = "\u2705"; } catch { ffmpegOk = "\u274C"; }
       const lines = [
-        "👁️ Vision MCP — Status",
+        "Vision MCP — Service Status",
         "",
-        `Gemini:             ${ok("GEMINI_API_KEY")}`,
-        `DashScope Beijing:  ${ok("DASHSCOPE_API_KEY_BEIJING")}`,
-        `DashScope Singapore:${ok("DASHSCOPE_API_KEY_SINGAPORE")}`,
-        `Bilibili Cookie:    ${biliOk}`,
-        `Public URL:         ${PUBLIC_URL_BASE || "(not configured)"}`,
+        `Gemini:        ${ok("GEMINI_API_KEY")}`,
+        `DashScope BJ:  ${ok("DASHSCOPE_API_KEY_BEIJING")}  (Qwen + Kimi)`,
+        `DashScope SG:  ${ok("DASHSCOPE_API_KEY_SINGAPORE")}`,
+        `Bilibili:      ${biliOk}`,
         "",
         "Available models:",
         ...Object.entries(MODEL_CATALOG).map(([name, { desc }]) => `  ${name} — ${desc}`),
+        "",
+        `yt-dlp:  ${ytdlpOk}`,
+        `ffmpeg:  ${ffmpegOk}`,
+        `Concurrency: ${taskSemaphore.active}/${MAX_CONCURRENCY} active, ${taskSemaphore.pending} queued`,
       ];
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
@@ -336,7 +462,7 @@ function registerTools(s) {
 // ========== SSE Transport ==========
 
 function createServer() {
-  const s = new McpServer({ name: "vision-mcp-server", version: "1.1.0" });
+  const s = new McpServer({ name: "vision-mcp-server", version: "1.3.0" });
   registerTools(s);
   return s;
 }
@@ -346,7 +472,7 @@ const sessions = {};
 
 app.get("/sse", async (req, res) => {
   const srv = createServer();
-  const transport = new SSEServerTransport("/terminal/messages", res);
+  const transport = new SSEServerTransport(SSE_MSG_PATH, res);
   sessions[transport.sessionId] = { transport, server: srv };
   res.on("close", () => { srv.close(); delete sessions[transport.sessionId]; });
   await srv.connect(transport);
@@ -360,13 +486,21 @@ app.post("/terminal/messages", async (req, res) => {
 });
 
 app.get("/health", (_, res) => {
-  res.json({ status: "ok", name: "vision-mcp", version: "1.1.0", models: Object.keys(MODEL_CATALOG).length });
+  res.json({
+    status: "ok",
+    name: "vision-mcp",
+    version: "1.3.0",
+    models: Object.keys(MODEL_CATALOG).length,
+    concurrency: { active: taskSemaphore.active, max: MAX_CONCURRENCY, queued: taskSemaphore.pending },
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`👁️ Vision MCP v1.1 started: http://0.0.0.0:${PORT}`);
-  console.log(`   Models: ${Object.keys(MODEL_CATALOG).length}`);
-  console.log(`   Bilibili: ${getBiliCookie() ? "✅" : "❌"}`);
-  console.log(`   Public URL: ${PUBLIC_URL_BASE || "(not configured)"}`);
-  console.log(`   Tools: watch_video, vision_status`);
+  console.log(`Vision MCP v1.3 started: http://0.0.0.0:${PORT}`);
+  console.log(`  Models: ${Object.keys(MODEL_CATALOG).length}`);
+  console.log(`  Bilibili cookie: ${getBiliCookie() ? "OK" : "N/A"}`);
+  console.log(`  Security: SSRF \u2705 | Injection \u2705 | Cleanup \u2705`);
+  console.log(`  Concurrency: max ${MAX_CONCURRENCY}, excess queued`);
+  console.log(`  SSE path: ${SSE_MSG_PATH}`);
+  console.log(`  Tools: watch_video, vision_status`);
 });
