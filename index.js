@@ -13,7 +13,9 @@ import dotenv from "dotenv";
 
 const execFileAsync = promisify(execFile);
 
-dotenv.config({ path: "/opt/vision-mcp/config.env" });
+// 先加载敏感配置（API keys），再加载普通配置
+dotenv.config({ path: "/opt/vision-mcp/secrets.env", override: true });
+dotenv.config({ path: "/opt/vision-mcp/config.env", override: true });
 
 const PORT = parseInt(process.env.VISION_MCP_PORT || "18092");
 const TEMP_DIR = process.env.VIDEO_TEMP_DIR || "/tmp/vision-mcp-videos";
@@ -22,7 +24,7 @@ const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50MB
 const MAX_CONCURRENCY = 2;
 
 // SSE 路径：客户端（经 Nginx）看到的外部路径，消除 sub_filter 依赖
-const SSE_MSG_PATH = process.env.SSE_MSG_PATH || "/terminal/messages";
+const SSE_MSG_PATH = process.env.SSE_MSG_PATH || "/vision/messages";
 
 // ========== 并发控制（轻量信号量，零依赖）==========
 
@@ -312,6 +314,7 @@ async function callDashScope(source, prompt, model, isFile, region, filesToClean
   return resp.choices?.[0]?.message?.content || "(未返回内容)";
 }
 
+
 // ========== 混元图片理解（专用于看图片，便宜）==========
 
 function getHunyuanClient() {
@@ -328,8 +331,9 @@ async function callHunyuanImage(imageUrl, prompt, model) {
   const useModel = model || process.env.HUNYUAN_IMAGE_MODEL || "hunyuan-vision";
 
   // 策略：优先直传URL，失败后fallback到base64（兼容防盗链/签名URL场景）
+  // 第一次尝试：直传URL
   try {
-    console.log("🖼️ 混元直传URL尝试...");
+    console.log(`🖼️ 混元直传URL尝试...`);
     const result = await client.chat.completions.create({
       model: useModel,
       messages: [{
@@ -346,7 +350,7 @@ async function callHunyuanImage(imageUrl, prompt, model) {
     console.log(`⚠️ 混元URL直传失败: ${urlErr.message}, 回退到base64...`);
   }
 
-  // fallback: 下载图片转base64
+  // 第二次尝试：下载图片转base64
   let base64Data;
   try {
     const resp = await fetch(imageUrl);
@@ -489,15 +493,16 @@ function registerTools(s) {
   s.registerTool(
     "watch",
     {
-      title: "看",
+      title: "看视频",
       description: `小克的眼睛。传入URL（视频/图片均可）或文件路径 + prompt，自动识别类型并返回内容描述。\n图片URL（.jpg/.png/.webp等）自动走混元图片理解。\nauto=自动路由，也可指定具体模型。\nB站视频通过API下载，YouTube直传Gemini。\n并发上限: ${MAX_CONCURRENCY}，超出排队等待。`,
       inputSchema: {
-        source: z.string().describe("视频/图片URL 或本地文件路径"),
+        source: z.string().describe("视频URL（YouTube/B站等）或本地文件路径"),
         prompt: z.string().default("请详细描述这个视频的内容，包括画面、声音、文字等信息。").describe("想了解什么"),
         model: z.enum(MODEL_NAMES).default("auto").describe("指定模型，auto=自动路由"),
       },
     },
     async ({ source, prompt, model }) => {
+      // 并发控制：超过 MAX_CONCURRENCY 的请求排队等待
       const queuePos = taskSemaphore.pending;
       if (queuePos > 0) {
         console.log(`⏳ 排队中... 前方 ${queuePos} 个任务，活跃 ${taskSemaphore.active}/${taskSemaphore.max}`);
@@ -517,6 +522,7 @@ function registerTools(s) {
       }
     }
   );
+
 
   s.registerTool(
     "vision_status",
@@ -574,7 +580,7 @@ app.get("/sse", async (req, res) => {
   await srv.connect(transport);
 });
 
-app.post("/terminal/messages", async (req, res) => {
+app.post("/messages", async (req, res) => {
   const sid = req.query.sessionId;
   const entry = sessions[sid];
   if (!entry) return res.status(400).json({ error: "Unknown session" });
@@ -592,7 +598,7 @@ app.get("/health", (_, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`👁️ 小克的眼睛 v1.4 — 视频+图片理解MCP启动: http://0.0.0.0:${PORT}`);
+  console.log(`👁️ 小克的眼睛 v1.4.0 — 视频理解MCP启动: http://0.0.0.0:${PORT}`);
   console.log(`   可用模型: ${Object.keys(MODEL_CATALOG).length} 个`);
   console.log(`   B站Cookie: ${getBiliCookie() ? "✅" : "❌"}`);
   console.log(`   安全: SSRF防护 ✅ | 命令注入防护 ✅ | 确定性清理 ✅`);
